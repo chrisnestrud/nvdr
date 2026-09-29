@@ -30,6 +30,8 @@
 //! - `state <name>` — lifecycle: `connecting`, `waiting_for_nvda`, `ready`,
 //!   `disconnected`, `quit`.
 //! - `error <message>` — non-fatal error worth surfacing to the controller.
+//! - With `--json-events`, NVDA output instead uses `event <json>` and retains
+//!   speech sequence/priority, pause, tone, and wave metadata in wire order.
 //!
 //! Everything else (parse warnings, connect attempts, backoff timing) goes to
 //! stderr where the add-on tees it into the NVDA log.
@@ -172,7 +174,7 @@ pub async fn run(args: crate::Args) -> Result<()> {
             }
         };
 
-        match session(conn, &channel, nvda_vk, args.observe).await {
+        match session(conn, &channel, nvda_vk, args.observe, args.json_events).await {
             SessionOutcome::Quit => {
                 emit_state("quit");
                 return Ok(());
@@ -196,6 +198,7 @@ async fn session(
     channel: &str,
     nvda_vk: u16,
     observe: bool,
+    json_events: bool,
 ) -> SessionOutcome {
     let (reader, writer) = tokio::io::split(conn);
     let writer = Arc::new(Mutex::new(writer));
@@ -228,7 +231,7 @@ async fn session(
                 if let Some(state) = peers.apply(&msg) {
                     emit_state(state);
                 }
-                emit_inbound(&msg);
+                emit_inbound(&msg, json_events);
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
@@ -400,7 +403,13 @@ fn unescape(s: &str) -> String {
     out
 }
 
-fn emit_inbound(msg: &Inbound) {
+fn emit_inbound(msg: &Inbound, json_events: bool) {
+    if json_events {
+        if let Some(event) = structured_event(msg) {
+            emit_line(&format!("event {event}"));
+            return;
+        }
+    }
     match msg {
         Inbound::Speak { sequence, .. } => {
             let text = protocol::speak_text(sequence);
@@ -418,15 +427,48 @@ fn emit_inbound(msg: &Inbound) {
     }
 }
 
+fn structured_event(msg: &Inbound) -> Option<serde_json::Value> {
+    match msg {
+        Inbound::Speak { sequence, priority } => Some(serde_json::json!({
+            "kind": "speak",
+            "text": flatten(&protocol::speak_text(sequence)),
+            "sequence": sequence,
+            "priority": priority,
+        })),
+        Inbound::Cancel => Some(serde_json::json!({"kind": "cancel"})),
+        Inbound::PauseSpeech { switch } => {
+            Some(serde_json::json!({"kind": "pause_speech", "switch": switch}))
+        }
+        Inbound::Tone {
+            hz,
+            length,
+            left,
+            right,
+        } => Some(serde_json::json!({
+            "kind": "tone",
+            "hz": hz,
+            "length": length,
+            "left": left,
+            "right": right,
+        })),
+        Inbound::Wave { file_name } => {
+            Some(serde_json::json!({"kind": "wave", "file_name": file_name}))
+        }
+        _ => None,
+    }
+}
+
 fn emit_speak(text: &str) {
     // Stdout contract is one event per line — collapse any embedded newlines
     // to spaces so a multi-line speech sequence still arrives as a single
     // `speak` event the controller can parse without state.
-    let flat: String = text
-        .chars()
+    emit_line(&format!("speak {}", flatten(text)));
+}
+
+fn flatten(text: &str) -> String {
+    text.chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    emit_line(&format!("speak {flat}"));
+        .collect()
 }
 
 fn emit_state(name: &str) {
@@ -503,5 +545,52 @@ mod tests {
             .all(|command| !command_allowed(command, true)));
         assert!(command_allowed(&Cmd::Quit, true));
         assert!(command_allowed(&Cmd::Combo(Vec::new()), false));
+    }
+
+    #[test]
+    fn structured_events_preserve_nvda_output_metadata() {
+        let sequence = vec![
+            json!("Hello "),
+            json!(["LangChangeCommand", {"lang": "en"}]),
+            json!("world"),
+        ];
+        assert_eq!(
+            structured_event(&Inbound::Speak {
+                sequence: sequence.clone(),
+                priority: Some(json!("now")),
+            }),
+            Some(json!({
+                "kind": "speak",
+                "text": "Hello world",
+                "sequence": sequence,
+                "priority": "now",
+            }))
+        );
+        assert_eq!(
+            structured_event(&Inbound::PauseSpeech { switch: true }),
+            Some(json!({"kind": "pause_speech", "switch": true}))
+        );
+        assert_eq!(
+            structured_event(&Inbound::Tone {
+                hz: Some(440.0),
+                length: Some(80.0),
+                left: Some(60),
+                right: Some(40),
+            }),
+            Some(json!({
+                "kind": "tone", "hz": 440.0, "length": 80.0,
+                "left": 60, "right": 40,
+            }))
+        );
+        assert_eq!(
+            structured_event(&Inbound::Wave {
+                file_name: Some("alert.wav".into())
+            }),
+            Some(json!({"kind": "wave", "file_name": "alert.wav"}))
+        );
+        assert_eq!(
+            structured_event(&Inbound::Cancel),
+            Some(json!({"kind": "cancel"}))
+        );
     }
 }
