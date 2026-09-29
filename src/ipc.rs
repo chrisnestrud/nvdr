@@ -69,45 +69,77 @@ enum SessionOutcome {
 
 #[derive(Default)]
 struct PeerState {
-    slaves: HashSet<u64>,
+    masters: HashSet<u64>,
+    followers: HashSet<u64>,
 }
 
 impl PeerState {
+    fn from_clients(clients: &[serde_json::Value]) -> Self {
+        let mut peers = Self::default();
+        for client in clients {
+            peers.insert(client);
+        }
+        peers
+    }
+
     fn apply(&mut self, message: &Inbound) -> Option<&'static str> {
+        let before = self.name();
         match message {
             Inbound::ChannelJoined { clients, .. } => {
-                self.slaves = clients.iter().filter_map(slave_id).collect();
-                Some(self.name())
+                *self = Self::from_clients(clients);
+                return Some(self.name());
             }
             Inbound::ClientJoined { client, .. } => {
-                let was_ready = !self.slaves.is_empty();
-                if let Some(id) = client.as_ref().and_then(slave_id) {
-                    self.slaves.insert(id);
+                if let Some(client) = client {
+                    self.insert(client);
                 }
-                (!was_ready && !self.slaves.is_empty()).then_some("ready")
             }
             Inbound::ClientLeft { client, .. } => {
-                let was_ready = !self.slaves.is_empty();
                 if let Some(id) = client.as_ref().and_then(client_id) {
-                    self.slaves.remove(&id);
+                    self.masters.remove(&id);
+                    self.followers.remove(&id);
                 }
-                (was_ready && self.slaves.is_empty()).then_some("waiting_for_nvda")
             }
             Inbound::NvdaNotConnected => {
-                let changed = !self.slaves.is_empty();
-                self.slaves.clear();
-                changed.then_some("waiting_for_nvda")
+                self.followers.clear();
             }
-            _ => None,
+            _ => {}
+        };
+        (before != self.name()).then_some(self.name())
+    }
+
+    fn insert(&mut self, client: &serde_json::Value) {
+        let Some(id) = client_id(client) else {
+            return;
+        };
+        match client
+            .get("connection_type")
+            .and_then(|value| value.as_str())
+        {
+            Some("master") => {
+                self.masters.insert(id);
+            }
+            Some("slave") => {
+                self.followers.insert(id);
+            }
+            _ => {}
         }
     }
 
     fn name(&self) -> &'static str {
-        if self.slaves.is_empty() {
-            "waiting_for_nvda"
-        } else {
-            "ready"
+        match self.followers.len() {
+            0 => "waiting_for_nvda",
+            1 => "ready",
+            _ => "ambiguous",
         }
+    }
+
+    fn follower_count(&self) -> usize {
+        self.followers.len()
+    }
+
+    fn master_count(&self) -> usize {
+        self.masters.len()
     }
 }
 
@@ -115,10 +147,33 @@ fn client_id(client: &serde_json::Value) -> Option<u64> {
     client.get("id")?.as_u64()
 }
 
-fn slave_id(client: &serde_json::Value) -> Option<u64> {
-    (client.get("connection_type")?.as_str()? == "slave")
-        .then(|| client_id(client))
-        .flatten()
+fn peer_event(
+    kind: &str,
+    client: Option<&serde_json::Value>,
+    origin: Option<u64>,
+    peers: &PeerState,
+) -> serde_json::Value {
+    let mut event = serde_json::json!({
+        "kind": kind,
+        "follower_count": peers.follower_count(),
+        "master_count": peers.master_count(),
+    });
+    let fields = event.as_object_mut().expect("JSON object");
+    if let Some(origin) = origin {
+        fields.insert("origin".into(), origin.into());
+    }
+    if let Some(client) = client {
+        if let Some(id) = client_id(client) {
+            fields.insert("peer_id".into(), id.into());
+        }
+        if let Some(connection_type) = client
+            .get("connection_type")
+            .and_then(|value| value.as_str())
+        {
+            fields.insert("connection_type".into(), connection_type.into());
+        }
+    }
+    event
 }
 
 fn command_allowed(command: &Cmd, observe: bool) -> bool {
@@ -231,7 +286,7 @@ async fn session(
                 if let Some(state) = peers.apply(&msg) {
                     emit_state(state);
                 }
-                emit_inbound(&msg, json_events);
+                emit_inbound(&msg, json_events, &peers);
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
@@ -403,9 +458,21 @@ fn unescape(s: &str) -> String {
     out
 }
 
-fn emit_inbound(msg: &Inbound, json_events: bool) {
+fn emit_inbound(msg: &Inbound, json_events: bool, peers: &PeerState) {
     if json_events {
-        if let Some(event) = structured_event(msg) {
+        let event = match msg {
+            Inbound::ChannelJoined { origin, .. } => {
+                Some(peer_event("channel_joined", None, *origin, peers))
+            }
+            Inbound::ClientJoined { client, origin } => {
+                Some(peer_event("client_joined", client.as_ref(), *origin, peers))
+            }
+            Inbound::ClientLeft { client, origin } => {
+                Some(peer_event("client_left", client.as_ref(), *origin, peers))
+            }
+            _ => structured_event(msg),
+        };
+        if let Some(event) = event {
             emit_line(&format!("event {event}"));
             return;
         }
@@ -496,37 +563,59 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn peer_state_follows_slave_membership() {
+    fn peer_state_counts_masters_and_followers() {
         let mut peers = PeerState::default();
+        peers.apply(&Inbound::ChannelJoined {
+            channel: None,
+            clients: vec![
+                json!({"id": 1, "connection_type": "master"}),
+                json!({"id": 2, "connection_type": "slave"}),
+            ],
+            origin: Some(3),
+        });
+        assert_eq!(peers.master_count(), 1);
+        assert_eq!(peers.follower_count(), 1);
+        assert_eq!(peers.name(), "ready");
 
+        peers.apply(&Inbound::ClientJoined {
+            client: Some(json!({"id": 4, "connection_type": "slave"})),
+            origin: Some(4),
+        });
+        assert_eq!(peers.follower_count(), 2);
+        assert_eq!(peers.name(), "ambiguous");
+    }
+
+    #[test]
+    fn peer_event_contains_safe_counts_and_origin() {
+        let peers = PeerState::from_clients(&[
+            json!({"id": 1, "connection_type": "master"}),
+            json!({"id": 2, "connection_type": "slave"}),
+        ]);
         assert_eq!(
-            peers.apply(&Inbound::ChannelJoined {
-                channel: Some("test".into()),
-                clients: vec![json!({"id": 1, "connection_type": "master"})],
-                origin: Some(2),
+            peer_event("channel_joined", None, Some(9), &peers),
+            json!({
+                "kind": "channel_joined",
+                "origin": 9,
+                "follower_count": 1,
+                "master_count": 1,
             }),
-            Some("waiting_for_nvda")
         );
+    }
+
+    #[test]
+    fn peer_event_identifies_changed_peer() {
+        let client = json!({"id": 4, "connection_type": "slave"});
+        let peers = PeerState::from_clients(std::slice::from_ref(&client));
         assert_eq!(
-            peers.apply(&Inbound::ClientJoined {
-                client: Some(json!({"id": 3, "connection_type": "slave"})),
-                origin: Some(3),
+            peer_event("client_joined", Some(&client), Some(4), &peers),
+            json!({
+                "kind": "client_joined",
+                "origin": 4,
+                "peer_id": 4,
+                "connection_type": "slave",
+                "follower_count": 1,
+                "master_count": 0,
             }),
-            Some("ready")
-        );
-        assert_eq!(
-            peers.apply(&Inbound::ClientJoined {
-                client: Some(json!({"id": 4, "connection_type": "master"})),
-                origin: Some(4),
-            }),
-            None
-        );
-        assert_eq!(
-            peers.apply(&Inbound::ClientLeft {
-                client: Some(json!({"id": 3, "connection_type": "slave"})),
-                origin: Some(3),
-            }),
-            Some("waiting_for_nvda")
         );
     }
 
