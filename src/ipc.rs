@@ -176,8 +176,9 @@ fn peer_event(
     event
 }
 
-fn command_allowed(command: &Cmd, observe: bool) -> bool {
-    !observe || matches!(command, Cmd::Quit)
+fn command_allowed(command: &Cmd, observe: bool, follower_count: usize) -> bool {
+    matches!(command, Cmd::Quit | Cmd::ReleaseAll)
+        || (!observe && follower_count == 1)
 }
 
 pub async fn run(args: crate::Args) -> Result<()> {
@@ -293,8 +294,12 @@ async fn session(
                     // Stdin closed — controller is gone; shut down cleanly.
                     break SessionOutcome::Quit;
                 };
-                if !command_allowed(&cmd, observe) {
-                    emit_error("observer mode rejects remote-control commands");
+                if !command_allowed(&cmd, observe, peers.follower_count()) {
+                    emit_error(if observe {
+                        "observer mode rejects remote-control commands"
+                    } else {
+                        "remote-control command requires exactly one follower"
+                    });
                     continue;
                 }
                 match cmd {
@@ -626,14 +631,21 @@ mod tests {
             Cmd::Combo(Vec::new()),
             Cmd::Type("text".into()),
             Cmd::Sas,
-            Cmd::ReleaseAll,
         ];
 
         assert!(controls
             .iter()
-            .all(|command| !command_allowed(command, true)));
-        assert!(command_allowed(&Cmd::Quit, true));
-        assert!(command_allowed(&Cmd::Combo(Vec::new()), false));
+            .all(|command| !command_allowed(command, true, 1)));
+        assert!(command_allowed(&Cmd::Quit, true, 0));
+        assert!(command_allowed(&Cmd::ReleaseAll, true, 0));
+    }
+
+    #[test]
+    fn control_requires_exactly_one_follower() {
+        assert!(!command_allowed(&Cmd::Combo(Vec::new()), false, 0));
+        assert!(command_allowed(&Cmd::Combo(Vec::new()), false, 1));
+        assert!(!command_allowed(&Cmd::Combo(Vec::new()), false, 2));
+        assert!(command_allowed(&Cmd::ReleaseAll, false, 2));
     }
 
     #[test]
