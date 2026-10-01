@@ -66,7 +66,20 @@ confspec = {
     # How many consecutive failed connection attempts before we stop retrying
     # and wait for the user to re-trigger. 0 = retry forever (old behavior).
     "maxConnectAttempts": "integer(default=5, min=0, max=100)",
+    # -- Behavior --
+    # Drop the remote's relayed speech locally while key forwarding is on.
+    # For when both machines are in the same room and the remote is already
+    # audible through its own speakers. Add-on status announcements still speak.
+    "muteRemoteSpeechWhileControlling": "boolean(default=False)",
 }
+
+# Settings that shape the ssh / nvdr invocation. Changing any of these while
+# connected restarts the bridge; everything else in confspec is read live.
+_CONNECTION_KEYS = (
+    "sshCommand", "sshHost", "sshPort", "sshUser", "sshExtraArgs",
+    "remoteNvdrCommand", "relayHost", "relayPort", "channel", "fingerprint",
+    "insecure", "maxConnectAttempts",
+)
 
 
 def _is_nvda_modifier(vkCode, extended):
@@ -386,9 +399,9 @@ class NvdrBridge:
         if head == "speak":
             # speech.speakMessage routes through NVDA's synth — wx.CallAfter
             # to land on the main thread.
-            wx.CallAfter(speech.speakMessage, rest)
+            wx.CallAfter(self._speak_remote, rest)
         elif head == "cancel":
-            wx.CallAfter(speech.cancelSpeech)
+            wx.CallAfter(self._cancel_remote)
         elif head == "state":
             self._handle_state(rest)
         elif head == "error":
@@ -398,6 +411,29 @@ class NvdrBridge:
             log.warning(f"nvdr error: {rest}")
         else:
             log.debug(f"nvdrBridge: unknown event line: {line!r}")
+
+    def _remote_speech_muted(self):
+        """Whether relayed remote speech should be dropped right now.
+
+        Evaluated on the main thread (via wx.CallAfter) so it reads config and
+        the passthrough flag at the moment the speech would actually play.
+        """
+        return (
+            self.passthrough
+            and config.conf["nvdrBridge"]["muteRemoteSpeechWhileControlling"]
+        )
+
+    def _speak_remote(self, text):
+        if self._remote_speech_muted():
+            return
+        speech.speakMessage(text)
+
+    def _cancel_remote(self):
+        # Muted: there's no relayed speech to cut, and cancelling would only
+        # clip a local status announcement.
+        if self._remote_speech_muted():
+            return
+        speech.cancelSpeech()
 
     def _handle_state(self, name):
         if name == "ready":
@@ -810,8 +846,31 @@ class NvdrBridgeSettings(SettingsPanel):
 
         sHelper.addItem(relaySizer)
 
+        # -- Behavior group ------------------------------------------------
+        behaviorSizer = wx.StaticBoxSizer(
+            wx.VERTICAL, self,
+            # Translators: settings group label
+            label=_("Behavior"),
+        )
+        behaviorHelper = guiHelper.BoxSizerHelper(self, sizer=behaviorSizer)
+
+        # Translators: settings field. For when the remote machine is in the
+        # same room and already audible through its own speakers.
+        self.muteWhileControllingCheck = behaviorHelper.addItem(
+            wx.CheckBox(
+                self,
+                label=_("&Mute remote speech locally while controlling the remote"),
+            )
+        )
+        self.muteWhileControllingCheck.SetValue(
+            cfg["muteRemoteSpeechWhileControlling"]
+        )
+
+        sHelper.addItem(behaviorSizer)
+
     def onSave(self):
         cfg = config.conf["nvdrBridge"]
+        before = {k: cfg[k] for k in _CONNECTION_KEYS}
         cfg["sshHost"] = self.sshHostEdit.GetValue()
         cfg["sshPort"] = self.sshPortSpin.GetValue()
         cfg["sshUser"] = self.sshUserEdit.GetValue()
@@ -824,9 +883,15 @@ class NvdrBridgeSettings(SettingsPanel):
         cfg["fingerprint"] = self.fingerprintEdit.GetValue()
         cfg["insecure"] = self.insecureCheck.GetValue()
         cfg["maxConnectAttempts"] = self.maxAttemptsSpin.GetValue()
+        cfg["muteRemoteSpeechWhileControlling"] = (
+            self.muteWhileControllingCheck.GetValue()
+        )
         # Apply the new connection params immediately rather than making the
         # user restart NVDA to see the change take effect — but only if a
-        # session is already up. Connection is lazy (NVDA+F11), so saving
-        # settings must not itself bring the bridge online.
-        if _bridge is not None and _bridge.proc is not None:
+        # session is already up and a connection setting actually changed
+        # (behavior toggles are read live; no need to drop the session).
+        # Connection is lazy (NVDA+F11), so saving settings must not itself
+        # bring the bridge online.
+        changed = any(cfg[k] != before[k] for k in _CONNECTION_KEYS)
+        if changed and _bridge is not None and _bridge.proc is not None:
             wx.CallAfter(_bridge.restart)

@@ -67,8 +67,18 @@ NVDA → Preferences → Settings → **nvdr Bridge**.
   Each failed attempt is spaced by an exponential backoff (0.5s, 1s, 2s … up
   to 30s), and the counter resets to 0 every time a connection succeeds.
 
-Saving the panel restarts the bridge **only if it's currently connected** —
-saving never starts a connection by itself (that's what NVDA+F11 is for).
+**Behavior** group:
+
+- **Mute remote speech locally while controlling the remote** — while key
+  forwarding is on, don't speak the remote NVDA's speech on this machine. Useful
+  when both machines are in the same room and the remote is already audible
+  through its own speakers. The add-on's own announcements ("Sending keys
+  locally", connect/disconnect notices) still speak. Off by default; takes
+  effect immediately.
+
+Saving the panel restarts the bridge **only if it's currently connected and a
+connection setting changed** — saving never starts a connection by itself
+(that's what NVDA+F11 is for).
 
 ## Use
 
